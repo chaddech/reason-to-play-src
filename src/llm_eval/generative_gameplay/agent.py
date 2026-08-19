@@ -60,6 +60,10 @@ from src.llm_eval.generative_gameplay.export_replay import (
     capture_state,
     write_replay_file,
 )
+from src.llm_eval.shared.behavior_metrics import (
+    behavior_scalar_metrics,
+    summarize_behavior,
+)
 from src.llm_eval.shared.event_logger import EventLogger
 from src.llm_eval.shared.observation_formatter import ObservationFormatter
 from src.llm_eval.shared.response_parser import ResponseParser
@@ -713,7 +717,17 @@ class GameplayAgent:
                 "start_level": start_level,
                 "rationale_mode": self.cfg.harness.rationale_mode,
                 "max_levels": max_levels,
+                "idle_frames": self.cfg.game.idle_frames,
                 "advancement_strategy": advancement.strategy,
+                "level_frame_budget": getattr(
+                    advancement, "level_frame_budget", None
+                ),
+                "total_frame_budget": getattr(
+                    advancement, "total_frame_budget", None
+                ),
+                "consecutive_wins_required": getattr(
+                    advancement, "consecutive_wins_required", None
+                ),
                 "prompt_name": self.harness.prompt_name,
                 "system_prompt_hash": self.system_prompt_hash,
                 "suggestion_level": self.cfg.harness.suggestion_level,
@@ -774,6 +788,7 @@ class GameplayAgent:
         level_cap = (
             num_levels if max_levels == 0 else min(num_levels, start_level + max_levels)
         )
+        self.log_data["meta"]["level_count"] = level_cap - start_level
         print(
             f"Game {game_name} has {num_levels} levels (playing {level_cap - start_level})"
         )
@@ -991,12 +1006,27 @@ class GameplayAgent:
             for step, interaction in self.interaction_tracker.discovery_order
         ]
 
+        consecutive_wins_required = getattr(
+            advancement, "consecutive_wins_required", 1
+        )
+        self.log_data["behavior_metrics"] = summarize_behavior(
+            self.log_data["steps"],
+            total_frames=self.total_frames,
+            start_level=start_level,
+            level_count=level_cap - start_level,
+            final_level=self.current_level,
+            consecutive_wins_required=consecutive_wins_required,
+        )
+
         self._save_log_final()
 
         # Finish W&B run
         if self._wandb_run:
             import wandb
 
+            behavior_wandb = behavior_scalar_metrics(
+                self.log_data["behavior_metrics"]
+            )
             wandb.log(
                 {
                     "final_outcome": self.log_data["outcome"],
@@ -1011,6 +1041,7 @@ class GameplayAgent:
                     "final_output_tokens": self.total_output_tokens,
                     "final_reasoning_tokens": self.total_reasoning_tokens,
                     "final_cost": self.total_cost,
+                    **behavior_wandb,
                 }
             )
             # Log the complete tables
@@ -1027,6 +1058,7 @@ class GameplayAgent:
             "cumulative_wins": self.cumulative_wins,
             "cumulative_losses": self.cumulative_losses,
             "cumulative_success": self.cumulative_success,
+            "behavior_metrics": self.log_data["behavior_metrics"],
         }
 
     def _run_level(self, lvl: int, remaining_frames: int) -> tuple[bool, bool]:
@@ -1209,6 +1241,7 @@ class GameplayAgent:
             # the pre-action state is the only state associated with this
             # step.
             if action_str == "reset":
+                step_interactions = []
                 reward = 0
                 won = False
                 died = True
@@ -1294,6 +1327,16 @@ class GameplayAgent:
                 # Track interactions for coverage metrics
                 interactions_before = len(self.interaction_tracker.all_instances)
                 self.interaction_tracker.record_events(events, prev_obs, self.step_num)
+                step_interactions = [
+                    {
+                        "actor_color": interaction[0],
+                        "effect": interaction[1],
+                        "actee_color": interaction[2],
+                    }
+                    for _, interaction, _ in self.interaction_tracker.all_instances[
+                        interactions_before:
+                    ]
+                ]
 
                 # Log new interactions to W&B table
                 if self._wandb_run and self._interaction_table is not None:
@@ -1327,6 +1370,8 @@ class GameplayAgent:
 
             step_log = {
                 "step": self.step_num,
+                "frame": (self.step_num + 1)
+                * (1 + self.cfg.game.idle_frames),
                 "level": lvl,
                 "attempt": self.attempt,
                 # Pre-action state (what the LLM saw when choosing this
@@ -1352,6 +1397,7 @@ class GameplayAgent:
                 # is emitted explicitly so the replay schema matches the
                 # human-replay pipeline.
                 "timeout": False,
+                "interactions": step_interactions,
                 "realworld_ts": realworld_ts,
                 "conversation_length": self.harness.conversation_length,
                 # Per-step token / cost totals.  These are the sums

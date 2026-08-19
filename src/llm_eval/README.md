@@ -112,3 +112,7 @@ agent's reasoning:
 - `generative_gameplay/` -- LLM plays games (see its README)
 - `human_replay/` -- Two-phase replay pipeline (see its README)
 - `shared/` -- Config, harness, formatters, LLM wrappers
+
+Behavioral performance, human-cohort comparison, and persistent-state memory
+measures are documented in [`BEHAVIOR_METRICS.md`](BEHAVIOR_METRICS.md). The
+analyzer is available as `python -m src.llm_eval.behavior_analysis`.

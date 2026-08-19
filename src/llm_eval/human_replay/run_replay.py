@@ -56,6 +56,10 @@ from src.llm_eval.shared.config import (  # noqa: E402
     rationale_mode_to_effort,
     validate_config,
 )
+from src.llm_eval.shared.behavior_metrics import (  # noqa: E402
+    behavior_scalar_metrics,
+    summarize_behavior,
+)
 from src.llm_eval.shared.prompt_loader import PromptLoader  # noqa: E402
 from src.llm_eval.shared.replay_codec import save_replay  # noqa: E402
 from src.llm_eval.shared.response_parser import ResponseParser  # noqa: E402
@@ -284,6 +288,21 @@ def _build_output_snapshot(
 ) -> dict:
     """Build the .replay.json.gz output dict from current accumulated state."""
     vgdl_game_name = _behavioral_to_vgdl_game_name(game_name)
+    start_level = game_plays[0]["level_id"] if game_plays else 0
+    all_level_ids = [int(play["level_id"]) for play in game_plays]
+    level_count = max(all_level_ids) - start_level + 1 if all_level_ids else 1
+    final_level = max(
+        (int(step.get("level", start_level)) for step in all_steps),
+        default=start_level,
+    )
+    behavior_metrics = summarize_behavior(
+        all_steps,
+        total_frames=total_frames,
+        start_level=start_level,
+        level_count=level_count,
+        final_level=final_level,
+        consecutive_wins_required=2,
+    )
     return {
         "game": vgdl_game_name,
         "source": source,
@@ -292,7 +311,8 @@ def _build_output_snapshot(
         "system_prompt": system_prompt,
         "prompt_name": agent.harness.prompt_name,
         "suggestion_level": harness_cfg.suggestion_level,
-        "start_level": game_plays[0]["level_id"] if game_plays else 0,
+        "start_level": start_level,
+        "final_level": final_level,
         "started_at": datetime.now().isoformat(),
         "finished_at": datetime.now().isoformat(),
         "outcome": "completed" if completed else "running",
@@ -308,6 +328,8 @@ def _build_output_snapshot(
             "action_frames_only": replay_cfg.action_frames_only,
             "stride": replay_cfg.stride,
             "num_trials": len(game_plays),
+            "level_count": level_count,
+            "consecutive_wins_required": 2,
             "llm_model": llm_config.model if llm_config.model else None,
             "completed": completed,
             "pipeline": "unified",
@@ -317,6 +339,7 @@ def _build_output_snapshot(
         "game_description": game_description,
         "steps": all_steps,
         "states": all_viewer_states,
+        "behavior_metrics": behavior_metrics,
     }
 
 
@@ -578,9 +601,18 @@ def process_game(
             # Track interactions
             events = record["events"]
             prev_obs = record["prev_obs"]
+            step_interactions = []
             if events and prev_obs is not None:
                 before = len(interaction_tracker.all_instances)
                 interaction_tracker.record_events(events, prev_obs, total_prompts)
+                step_interactions = [
+                    {
+                        "actor_color": interaction[0],
+                        "effect": interaction[1],
+                        "actee_color": interaction[2],
+                    }
+                    for _, interaction, _ in interaction_tracker.all_instances[before:]
+                ]
                 # Log new interactions to table
                 if interaction_table is not None:
                     for inst_step, interaction, (
@@ -620,6 +652,7 @@ def process_game(
                 "won": record["won"],
                 "lose": record["lose"],
                 "timeout": record["timeout"],
+                "interactions": step_interactions,
                 "state_index": state_offset + record["frame_idx"],
                 # Wall-clock Unix timestamp of the observation the participant
                 # saw before this action (sourced from zstate["ts"] by
@@ -840,6 +873,7 @@ def process_game(
         wandb.save(str(output_file), policy="end")
         if narration_file is not None and all_imputation_steps:
             wandb.save(str(narration_file), policy="end")
+        behavior_wandb = behavior_scalar_metrics(output["behavior_metrics"])
         wandb.log(
             {
                 "final_outcome": "completed",
@@ -849,6 +883,7 @@ def process_game(
                 "final_cumulative_success": cumulative_wins - cumulative_losses,
                 "final_interactions_discovered": interaction_tracker.interactions_discovered,
                 "final_interaction_coverage": interaction_tracker.coverage,
+                **behavior_wandb,
             }
         )
         if interaction_table is not None:
@@ -859,6 +894,7 @@ def process_game(
         "total_prompts": total_prompts,
         "num_trials": len(game_plays),
         "output_path": str(output_file),
+        "behavior_metrics": output["behavior_metrics"],
         "skipped": False,
     }
 
